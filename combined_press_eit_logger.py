@@ -6,6 +6,7 @@ import threading
 import time
 from datetime import datetime
 
+import matplotlib.pyplot as plt
 import numpy as np
 import serial
 import pyeit.eit.protocol as protocol
@@ -167,6 +168,66 @@ class ForceReader(threading.Thread):
             except Exception as exc:
                 print_info(f"Unexpected error in force reader thread: {exc}")
                 time.sleep(0.05)
+
+    def stop(self):
+        self.stop_evt.set()
+
+
+class LiveEITPlotter(threading.Thread):
+    def __init__(self, q_eit, q_force, current_state, refresh_interval=0.1, group=None):
+        super().__init__(group=group, name="LiveEITPlotter", daemon=True)
+        self.q_eit = q_eit
+        self.q_force = q_force
+        self.current_state = current_state
+        self.refresh_interval = refresh_interval
+        self.stop_evt = threading.Event()
+
+        plt.ion()
+        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        self.line, = self.ax.plot([], [], color="tab:blue")
+        self.ax.set_xlabel("EIT channel index")
+        self.ax.set_ylabel("Value")
+        self.ax.grid(False)
+        self.ax.set_xticks([])
+        self.ax.set_title("Live EIT signal")
+        self.fig.canvas.manager.set_window_title("Live EIT signal")
+        self.fig.canvas.draw()
+
+    def _peek_latest(self, q):
+        with q.mutex:
+            if q.queue:
+                return q.queue[-1]
+        return None
+
+    def _update_title(self, force_value, position):
+        if force_value is not None and position is not None:
+            return f"Force={force_value:.3f}N | Position={position}"
+        if force_value is not None:
+            return f"Force={force_value:.3f}N"
+        if position is not None:
+            return f"Position={position}"
+        return "Live EIT signal"
+
+    def run(self):
+        while not self.stop_evt.is_set():
+            latest_eit = self._peek_latest(self.q_eit)
+            latest_force = self._peek_latest(self.q_force)
+            if latest_eit is not None and "readings" in latest_eit and latest_eit["readings"]:
+                values = np.asarray(latest_eit["readings"], dtype=float)
+                x = np.arange(values.size)
+                self.line.set_data(x, values)
+                self.ax.set_xlim(0, max(1, values.size - 1))
+                ymin, ymax = np.min(values), np.max(values)
+                margin = max(abs(ymin), abs(ymax), 1e-6) * 0.05
+                self.ax.set_ylim(ymin - margin, ymax + margin)
+
+                force_value = latest_force.get("force") if latest_force is not None else self.current_state.get("force")
+                position = self.current_state.get("position")
+                self.ax.set_title(self._update_title(force_value, position))
+                self.fig.canvas.draw_idle()
+                plt.pause(0.001)
+
+            time.sleep(self.refresh_interval)
 
     def stop(self):
         self.stop_evt.set()
@@ -397,6 +458,9 @@ def main():
     q_force = queue.Queue(maxsize=200)
     q_eit = queue.Queue(maxsize=4000)
 
+    current_state = {"position": None, "force": None}
+    plotter = LiveEITPlotter(q_eit=q_eit, q_force=q_force, current_state=current_state)
+
     printer = PrinterController(printer_serial, q_printer)
     force_reader = ForceReader(force_serial, q_force)
     force_reader.start()
@@ -412,6 +476,7 @@ def main():
         q_out=q_eit,
     )
     eit_reader.start()
+    plotter.start()
 
     eit_channel_count = 0
     t0 = time.time()
@@ -454,8 +519,12 @@ def main():
 
                     printer.write(str.encode("G1 X " + str(Cornerposition[0] + x) + " Y " + str(Cornerposition[1] + y) + " F800\r\n"), description="move_xy")
                     printer.wait_for_position()
+                    current_state["position"] = f"x={x}mm y={y}mm"
                     print_info(f"Moved to x={x}mm, y={y}mm. Target force: {targetforce}N. Taking reading...")
                     actualforce, starttime, midtime, endtime = takereading(targetforce, printer, q_force)
+                    current_force_sample = sample_force_now(q_force)
+                    if current_force_sample is not None:
+                        current_state["force"] = current_force_sample.get("force")
                     print_info(f"Measurement taken. Start: {starttime.isoformat()}, Mid: {midtime.isoformat()}, End: {endtime.isoformat()}")
 
                     while not q_eit.empty():
@@ -493,6 +562,8 @@ def main():
             removeProbe(printer)
         except Exception:
             pass
+        plotter.stop()
+        plotter.join(timeout=1.0)
         eit_reader.stop()
         eit_reader.join(timeout=1.0)
         force_reader.stop()
