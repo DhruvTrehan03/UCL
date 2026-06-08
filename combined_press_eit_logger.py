@@ -6,7 +6,6 @@ import threading
 import time
 from datetime import datetime
 
-import matplotlib.pyplot as plt
 import numpy as np
 import serial
 import pyeit.eit.protocol as protocol
@@ -173,64 +172,7 @@ class ForceReader(threading.Thread):
         self.stop_evt.set()
 
 
-class LiveEITPlotter(threading.Thread):
-    def __init__(self, q_eit, q_force, current_state, refresh_interval=0.1, group=None):
-        super().__init__(group=group, name="LiveEITPlotter", daemon=True)
-        self.q_eit = q_eit
-        self.q_force = q_force
-        self.current_state = current_state
-        self.refresh_interval = refresh_interval
-        self.stop_evt = threading.Event()
 
-        plt.ion()
-        self.fig, self.ax = plt.subplots(figsize=(10, 6))
-        self.line, = self.ax.plot([], [], color="tab:blue")
-        self.ax.set_xlabel("EIT channel index")
-        self.ax.set_ylabel("Value")
-        self.ax.grid(False)
-        self.ax.set_xticks([])
-        self.ax.set_title("Live EIT signal")
-        self.fig.canvas.manager.set_window_title("Live EIT signal")
-        self.fig.canvas.draw()
-
-    def _peek_latest(self, q):
-        with q.mutex:
-            if q.queue:
-                return q.queue[-1]
-        return None
-
-    def _update_title(self, force_value, position):
-        if force_value is not None and position is not None:
-            return f"Force={force_value:.3f}N | Position={position}"
-        if force_value is not None:
-            return f"Force={force_value:.3f}N"
-        if position is not None:
-            return f"Position={position}"
-        return "Live EIT signal"
-
-    def run(self):
-        while not self.stop_evt.is_set():
-            latest_eit = self._peek_latest(self.q_eit)
-            latest_force = self._peek_latest(self.q_force)
-            if latest_eit is not None and "readings" in latest_eit and latest_eit["readings"]:
-                values = np.asarray(latest_eit["readings"], dtype=float)
-                x = np.arange(values.size)
-                self.line.set_data(x, values)
-                self.ax.set_xlim(0, max(1, values.size - 1))
-                ymin, ymax = np.min(values), np.max(values)
-                margin = max(abs(ymin), abs(ymax), 1e-6) * 0.05
-                self.ax.set_ylim(ymin - margin, ymax + margin)
-
-                force_value = latest_force.get("force") if latest_force is not None else self.current_state.get("force")
-                position = self.current_state.get("position")
-                self.ax.set_title(self._update_title(force_value, position))
-                self.fig.canvas.draw_idle()
-                plt.pause(0.001)
-
-            time.sleep(self.refresh_interval)
-
-    def stop(self):
-        self.stop_evt.set()
 
 
 class PrinterController:
@@ -374,6 +316,120 @@ def removeProbe(printer):
     printer.wait_for_position()
 
 
+class MeasurementRunner(threading.Thread):
+    """Run all measurements in a background thread while GUI runs on main thread"""
+    def __init__(self, printer_serial, force_serial, q_printer, q_force, q_eit, current_state, output_dir):
+        super().__init__(daemon=True, name="MeasurementRunner")
+        self.printer_serial = printer_serial
+        self.force_serial = force_serial
+        self.q_printer = q_printer
+        self.q_force = q_force
+        self.q_eit = q_eit
+        self.current_state = current_state
+        self.output_dir = output_dir
+        self.stop_evt = threading.Event()
+        
+    def run(self):
+        combined_csv = os.path.join(self.output_dir, 'testing.csv')
+        legacy_csv = os.path.join(self.output_dir, 'testing.txt')
+        
+        printer = PrinterController(self.printer_serial, self.q_printer)
+        
+        # Detect EIT channel count
+        eit_channel_count = 0
+        t0 = time.time()
+        while time.time() - t0 < 10:
+            try:
+                samp = self.q_eit.get(timeout=1.0)
+                if samp and 'readings' in samp and len(samp['readings']) > 0:
+                    eit_channel_count = len(samp['readings'])
+                    print_info(f"Detected EIT channel count: {eit_channel_count}")
+                    break
+            except queue.Empty:
+                continue
+        
+        if eit_channel_count == 0:
+            print_info("No EIT data detected, exiting")
+            return
+        
+        print_info("Starting synchronized logging of printer control and EIT data...\n")
+        
+        try:
+            setup(printer)
+            xs = [0,  0, 15, 15, 25, 25]
+            ys = [0, 15, 1, 14, 2, 13]
+            target = [0.5, 1, 1.5, 2, 3, 4]
+
+            for k in range(len(target)):
+                if self.stop_evt.is_set():
+                    break
+                for i in range(3):
+                    if self.stop_evt.is_set():
+                        break
+                    for j in range(len(xs)):
+                        if self.stop_evt.is_set():
+                            break
+                        x = xs[j]
+                        y = ys[j]
+                        targetforce = target[k]
+
+                        printer.write(str.encode("G1 X " + str(Cornerposition[0] + x) + " Y " + str(Cornerposition[1] + y) + " F800\r\n"), description="move_xy")
+                        printer.wait_for_position()
+                        self.current_state["position"] = f"x={x}mm y={y}mm"
+                        print_info(f"Moved to x={x}mm, y={y}mm. Target force: {targetforce}N. Taking reading...")
+                        actualforce, starttime, midtime, endtime = takereading(targetforce, printer, self.q_force)
+                        current_force_sample = sample_force_now(self.q_force)
+                        if current_force_sample is not None:
+                            self.current_state["force"] = current_force_sample.get("force")
+                        print_info(f"Measurement taken. Start: {starttime.isoformat()}, Mid: {midtime.isoformat()}, End: {endtime.isoformat()}")
+
+                        while not self.q_eit.empty():
+                            try:
+                                self.q_eit.get_nowait()
+                            except queue.Empty:
+                                print_info("All EIT samples cleared before capture, proceeding with next measurement.")
+                                break
+                        print_info("Waiting briefly to capture EIT sample corresponding to this measurement...")
+                        time.sleep(0.5)
+                        eit_sample = sample_eit_now(self.q_eit)
+
+                        with open(legacy_csv, 'a', newline='') as legacy_file:
+                            legacy_file.write(f"{x}, {y}, {targetforce}, {starttime}, {midtime}, {endtime}\n")
+
+                        append_combined_row(
+                            combined_csv,
+                            x=x,
+                            y=y,
+                            targetforce=targetforce,
+                            actualforce=actualforce,
+                            starttime=starttime,
+                            midtime=midtime,
+                            endtime=endtime,
+                            eit_sample=eit_sample,
+                            channel_count=eit_channel_count,
+                        )
+
+                        print(f"Logged measurement at x={x}, y={y}, force={targetforce} with EIT capture {eit_sample['t_wall'] if eit_sample else 'none'}")
+                        time.sleep(waittime)
+        
+        except KeyboardInterrupt:
+            print_info("Measurement stopped by user")
+        except Exception as e:
+            print_info(f"Error in measurement runner: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            try:
+                removeProbe(printer)
+            except Exception:
+                pass
+            print(f"Combined synchronized log saved to {combined_csv}")
+            print(f"Legacy printer log saved to {legacy_csv}")
+    
+    def stop(self):
+        self.stop_evt.set()
+
+
 def ensure_combined_header(csv_path, channel_count):
     if os.path.exists(csv_path):
         return
@@ -432,8 +488,8 @@ def append_combined_row(csv_path, x, y, targetforce, actualforce, starttime, mid
 
 def main():
     parser = argparse.ArgumentParser(description="Synchronize EIT samples with printer control timestamps")
-    parser.add_argument('--printer-port', default='COM10', help='Serial port for printer controller')
-    parser.add_argument('--force-port', default='COM8', help='Serial port for force sensor')
+    parser.add_argument('--printer-port', default='/dev/ttyUSB0', help='Serial port for printer controller')
+    parser.add_argument('--force-port', default='/dev/ttyACM1', help='Serial port for force sensor')
     parser.add_argument('--output-dir', default=None, help='Directory for CSV logs')
     args = parser.parse_args()
 
@@ -444,9 +500,6 @@ def main():
         output_dir = args.output_dir
 
     os.makedirs(output_dir, exist_ok=True)
-
-    combined_csv = os.path.join(output_dir, 'repeats_20.csv')
-    legacy_csv = os.path.join(output_dir, 'repeats3.txt')
 
     print('Connecting to printer controller')
     printer_serial = serial.Serial(args.printer_port, 115200)
@@ -459,9 +512,8 @@ def main():
     q_eit = queue.Queue(maxsize=4000)
 
     current_state = {"position": None, "force": None}
-    plotter = LiveEITPlotter(q_eit=q_eit, q_force=q_force, current_state=current_state)
-
-    printer = PrinterController(printer_serial, q_printer)
+    
+    # Start background threads for data acquisition
     force_reader = ForceReader(force_serial, q_force)
     force_reader.start()
 
@@ -476,103 +528,40 @@ def main():
         q_out=q_eit,
     )
     eit_reader.start()
-    plotter.start()
+    print_info("EIT and force readers started...")
 
-    eit_channel_count = 0
-    t0 = time.time()
-    while time.time() - t0 < 10:
-        try:
-            samp = q_eit.get(timeout=1.0)
-            if samp and 'readings' in samp and len(samp['readings']) > 0:
-                eit_channel_count = len(samp['readings'])
-                print_info(f"Detected EIT channel count: {eit_channel_count}")
-                break
-        except queue.Empty:
-            continue
-
-    if eit_channel_count == 0:
-        print_info("No EIT data detected, exiting")
-        eit_reader.stop()
-        eit_reader.join(timeout=1.0)
-        force_reader.stop()
-        force_reader.join(timeout=1.0)
-        printer.close()
-        force_serial.close()
-        return
-
-    print('Connected')
-    time.sleep(2)
-
+    # Start measurement runner in background thread
+    measurement_runner = MeasurementRunner(
+        printer_serial=printer_serial,
+        force_serial=force_serial,
+        q_printer=q_printer,
+        q_force=q_force,
+        q_eit=q_eit,
+        current_state=current_state,
+        output_dir=output_dir
+    )
+    measurement_runner.start()
+    print_info("Measurement runner started...")
+    
     try:
-        setup(printer)
-        print_info("Starting synchronized logging of printer control and EIT data...\n")
-        xs = [0,  0, 15, 15, 25, 25]
-        ys = [0, 15, 1, 14, 2, 13]
-        target = [0.5, 1, 1.5, 2, 3, 4]
-
-        for k in range(len(target)):
-            for i in range(3):
-                for j in range(len(xs)):
-                    x = xs[j]
-                    y = ys[j]
-                    targetforce = target[k]
-
-                    printer.write(str.encode("G1 X " + str(Cornerposition[0] + x) + " Y " + str(Cornerposition[1] + y) + " F800\r\n"), description="move_xy")
-                    printer.wait_for_position()
-                    current_state["position"] = f"x={x}mm y={y}mm"
-                    print_info(f"Moved to x={x}mm, y={y}mm. Target force: {targetforce}N. Taking reading...")
-                    actualforce, starttime, midtime, endtime = takereading(targetforce, printer, q_force)
-                    current_force_sample = sample_force_now(q_force)
-                    if current_force_sample is not None:
-                        current_state["force"] = current_force_sample.get("force")
-                    print_info(f"Measurement taken. Start: {starttime.isoformat()}, Mid: {midtime.isoformat()}, End: {endtime.isoformat()}")
-
-                    while not q_eit.empty():
-                        try:
-                            q_eit.get_nowait()
-                            print_info("Cleared old EIT samples from queue")
-                        except queue.Empty:
-                            print_info("No more old EIT samples to clear")
-                            break
-                    print_info("Waiting briefly to capture EIT sample corresponding to this measurement...")
-                    time.sleep(0.5)
-                    eit_sample = sample_eit_now(q_eit)
-
-                    with open(legacy_csv, 'a', newline='') as legacy_file:
-                        legacy_file.write(f"{x}, {y}, {targetforce}, {starttime}, {midtime}, {endtime}\n")
-
-                    append_combined_row(
-                        combined_csv,
-                        x=x,
-                        y=y,
-                        targetforce=targetforce,
-                        actualforce=actualforce,
-                        starttime=starttime,
-                        midtime=midtime,
-                        endtime=endtime,
-                        eit_sample=eit_sample,
-                        channel_count=eit_channel_count,
-                    )
-
-                    print(f"Logged measurement at x={x}, y={y}, force={targetforce} with EIT capture {eit_sample['t_wall'] if eit_sample else 'none'}")
-                    time.sleep(waittime)
-
+        # Wait for measurement runner to complete
+        measurement_runner.join()
+    except KeyboardInterrupt:
+        print_info("\n\nStopped by user")
     finally:
-        try:
-            removeProbe(printer)
-        except Exception:
-            pass
-        plotter.stop()
-        plotter.join(timeout=1.0)
+        # Stop background threads
+        measurement_runner.stop()
         eit_reader.stop()
-        eit_reader.join(timeout=1.0)
         force_reader.stop()
-        force_reader.join(timeout=1.0)
-        printer.close()
+        
+        # Wait for threads to finish
+        measurement_runner.join(timeout=2.0)
+        eit_reader.join(timeout=2.0)
+        force_reader.join(timeout=2.0)
+        
+        printer_serial.close()
         force_serial.close()
-
-        print(f"Combined synchronized log saved to {combined_csv}")
-        print(f"Legacy printer log saved to {legacy_csv}")
+        print_info("All threads stopped and resources cleaned up")
 
 
 if __name__ == '__main__':
