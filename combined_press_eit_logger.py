@@ -128,6 +128,97 @@ class AmodoEITDevice(threading.Thread):
             pass
 
 
+class ForceReader(threading.Thread):
+    def __init__(self, force_serial, q_out, group=None):
+        super().__init__(group=group, name="ForceReader", daemon=True)
+        self.force_serial = force_serial
+        self.q = q_out
+        self.stop_evt = threading.Event()
+
+    def run(self):
+        self.force_serial.flushInput()
+        while not self.stop_evt.is_set():
+            try:
+                line = self.force_serial.readline()
+                if not line:
+                    time.sleep(0.01)
+                    continue
+
+                try:
+                    force_value = float(line.strip())
+                except ValueError:
+                    continue
+
+                sample = {
+                    "t": time.monotonic(),
+                    "t_wall": datetime.now().isoformat(),
+                    "epoch": time.time(),
+                    "force": force_value,
+                }
+
+                try:
+                    self.q.put_nowait(sample)
+                except queue.Full:
+                    try:
+                        self.q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.q.put_nowait(sample)
+            except Exception as exc:
+                print_info(f"Unexpected error in force reader thread: {exc}")
+                time.sleep(0.05)
+
+    def stop(self):
+        self.stop_evt.set()
+
+
+class PrinterController:
+    def __init__(self, printer_serial, q_out):
+        self.printer_serial = printer_serial
+        self.q = q_out
+
+    def _enqueue_event(self, event_type, payload, description=None):
+        event = {
+            "t": time.monotonic(),
+            "t_wall": datetime.now().isoformat(),
+            "epoch": time.time(),
+            "event_type": event_type,
+            "payload": payload,
+            "description": description,
+        }
+        try:
+            self.q.put_nowait(event)
+        except queue.Full:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                pass
+            self.q.put_nowait(event)
+
+    def write(self, command, description=None):
+        self.printer_serial.write(command)
+        command_text = command.decode(errors='ignore') if isinstance(command, (bytes, bytearray)) else str(command)
+        self._enqueue_event("printer_command", command_text, description)
+
+    def wait_for_position(self):
+        self.printer_serial.flush()
+        self.write(str.encode("M114 R\r\n"), description="position_request")
+        while True:
+            line = self.printer_serial.readline()
+            if not line:
+                continue
+            decoded = line.decode(errors='ignore').strip()
+            self._enqueue_event("printer_response", decoded, description="position_response")
+            if 'Count' in decoded:
+                break
+
+    def close(self):
+        try:
+            self.printer_serial.close()
+        except Exception:
+            pass
+
+
 def sample_eit_now(q_eit):
     last = None
     while True:
@@ -138,14 +229,8 @@ def sample_eit_now(q_eit):
     return last
 
 
-def waitforposition(Ender):
-    Ender.flush()
-    Ender.write(str.encode("M114 R\r\n"))
-    while True:
-        line = Ender.readline()
-        if line.find(b'Count') != -1:
-            break
-    return
+def waitforposition(printer):
+    printer.wait_for_position()
 
 
 # Printer-control defaults
@@ -155,68 +240,77 @@ step = 0.05
 waittime = 5
 
 
-def takereading(targetforce, Ender, Forces):
-    starttime = datetime.now()
-    Ender.write(str.encode("G1 Z" + str(Cornerposition[2]) + " F400\r\n"))
-    print_info(f"Lowering probe to starting position (Z={Cornerposition[2]}mm) for target force {targetforce}N...")
-    waitforposition(Ender)
-    print_info("Starting force readings...")
-    Forces.flushInput()
-    print_info("Waiting for initial force reading...")
+def sample_force_now(q_force):
+    last = None
     while True:
         try:
-            force = float(Forces.readline())
+            last = q_force.get_nowait()
+        except queue.Empty:
             break
-        except ValueError:
-            print("No force, trying again")
+    return last
 
+
+def takereading(targetforce, printer, q_force):
+    starttime = datetime.now()
+    printer.write(str.encode("G1 Z" + str(Cornerposition[2]) + " F400\r\n"), description="lower_to_start")
+    print_info(f"Lowering probe to starting position (Z={Cornerposition[2]}mm) for target force {targetforce}N...")
+    printer.wait_for_position()
+    print_info("Starting force readings...")
+    print_info("Waiting for initial force reading...")
+
+    force_sample = None
+    while force_sample is None:
+        force_sample = sample_force_now(q_force)
+        if force_sample is None:
+            time.sleep(0.05)
+
+    force = force_sample["force"]
     n = 1
     print_info(f"Initial force reading: {force:.3f}N. Adjusting position to reach target force of {targetforce}N...")
     while force < targetforce:
         print_info(f"Current force: {force:.3f}N, below target of {targetforce}N. Lowering further...")
-        Ender.write(str.encode("G1 Z" + str(Cornerposition[2] - n * step) + " F400\r\n"))
-        waitforposition(Ender)
-        Forces.flushInput()
+        printer.write(str.encode("G1 Z" + str(Cornerposition[2] - n * step) + " F400\r\n"), description="lower_step")
+        printer.wait_for_position()
 
-        while True:
-            try:
-                force = float(Forces.readline())
-                print(force)
-                break
-            except ValueError:
-                print("No force, trying again")
+        force_sample = None
+        while force_sample is None:
+            force_sample = sample_force_now(q_force)
+            if force_sample is None:
+                time.sleep(0.05)
 
+        force = force_sample["force"]
+        print_info(f"Updated force reading: {force:.3f}N")
         n += 1
         if n * step > 2:
             break
 
     midtime = datetime.now()
     time.sleep(waittime)
-    Ender.write(str.encode("G1 Z" + str(Cornerposition[2] + retractheight) + " F400\r\n"))
-    waitforposition(Ender)
+    printer.write(str.encode("G1 Z" + str(Cornerposition[2] + retractheight) + " F400\r\n"), description="retract_probe")
+    printer.wait_for_position()
     endtime = datetime.now()
     return force, starttime, midtime, endtime
 
 
-def setup(Ender):
-    Ender.write(str.encode("G1 Z" + str(Cornerposition[2] + retractheight) + " F400\r\n"))
+def setup(printer):
+    printer.write(str.encode("G1 Z" + str(Cornerposition[2] + retractheight) + " F400\r\n"), description="raise_probe")
     print("Homing")
-    Ender.write(str.encode("G28\r\n"))
+    printer.write(str.encode("G28\r\n"), description="home")
     print("Homed")
     print("Moving Z")
-    Ender.write(str.encode("G1 Z" + str(Cornerposition[2] + retractheight) + " F400\r\n"))
+    printer.write(str.encode("G1 Z" + str(Cornerposition[2] + retractheight) + " F400\r\n"), description="raise_probe_again")
     print("Moving X")
-    Ender.write(str.encode("G1 X " + str(Cornerposition[0]) + " Y " + str(Cornerposition[1]) + " F1000\r\n"))
+    printer.write(str.encode("G1 X " + str(Cornerposition[0]) + " Y " + str(Cornerposition[1]) + " F1000\r\n"), description="move_xy")
     print("Asking for Position")
-    waitforposition(Ender)
+    printer.wait_for_position()
     print("Position found")
 
 
-def removeProbe(Ender):
-    Ender.write(str.encode("G1 X " + str(Cornerposition[0] + 19) + " Y " + str(Cornerposition[1]) + " F800\r\n"))
-    waitforposition(Ender)
-    Ender.write(str.encode("G1 Z" + str(Cornerposition[2] + 1) + " F400\r\n"))
-    waitforposition(Ender)
+def removeProbe(printer):
+    printer.write(str.encode("G1 X " + str(Cornerposition[0] + 19) + " Y " + str(Cornerposition[1]) + " F800\r\n"), description="move_probe_out")
+    printer.wait_for_position()
+    printer.write(str.encode("G1 Z" + str(Cornerposition[2] + 1) + " F400\r\n"), description="lift_probe")
+    printer.wait_for_position()
 
 
 def ensure_combined_header(csv_path, channel_count):
@@ -294,13 +388,19 @@ def main():
     legacy_csv = os.path.join(output_dir, 'repeats3.txt')
 
     print('Connecting to printer controller')
-    Ender = serial.Serial(args.printer_port, 115200)
+    printer_serial = serial.Serial(args.printer_port, 115200)
     print('Connecting to force sensor')
-    Forces = serial.Serial(args.force_port, 115200)
+    force_serial = serial.Serial(args.force_port, 115200)
     print('Setting up EIT reader thread')
-    print("Initial Force:", Forces.readline().decode().strip())
 
+    q_printer = queue.Queue(maxsize=100)
+    q_force = queue.Queue(maxsize=200)
     q_eit = queue.Queue(maxsize=4000)
+
+    printer = PrinterController(printer_serial, q_printer)
+    force_reader = ForceReader(force_serial, q_force)
+    force_reader.start()
+
     eit_reader = AmodoEITDevice(
         NUM_ELECTRODES=16,
         INJ_STEP=8,
@@ -329,15 +429,17 @@ def main():
         print_info("No EIT data detected, exiting")
         eit_reader.stop()
         eit_reader.join(timeout=1.0)
-        Ender.close()
-        Forces.close()
+        force_reader.stop()
+        force_reader.join(timeout=1.0)
+        printer.close()
+        force_serial.close()
         return
 
     print('Connected')
     time.sleep(2)
 
     try:
-        setup(Ender)
+        setup(printer)
         print_info("Starting synchronized logging of printer control and EIT data...\n")
         xs = [0,  0, 15, 15, 25, 25]
         ys = [0, 15, 1, 14, 2, 13]
@@ -350,10 +452,10 @@ def main():
                     y = ys[j]
                     targetforce = target[k]
 
-                    Ender.write(str.encode("G1 X " + str(Cornerposition[0] + x) + " Y " + str(Cornerposition[1] + y) + " F800\r\n"))
-                    waitforposition(Ender)
+                    printer.write(str.encode("G1 X " + str(Cornerposition[0] + x) + " Y " + str(Cornerposition[1] + y) + " F800\r\n"), description="move_xy")
+                    printer.wait_for_position()
                     print_info(f"Moved to x={x}mm, y={y}mm. Target force: {targetforce}N. Taking reading...")
-                    actualforce, starttime, midtime, endtime = takereading(targetforce, Ender, Forces)
+                    actualforce, starttime, midtime, endtime = takereading(targetforce, printer, q_force)
                     print_info(f"Measurement taken. Start: {starttime.isoformat()}, Mid: {midtime.isoformat()}, End: {endtime.isoformat()}")
 
                     while not q_eit.empty():
@@ -388,13 +490,15 @@ def main():
 
     finally:
         try:
-            removeProbe(Ender)
+            removeProbe(printer)
         except Exception:
             pass
         eit_reader.stop()
         eit_reader.join(timeout=1.0)
-        Ender.close()
-        Forces.close()
+        force_reader.stop()
+        force_reader.join(timeout=1.0)
+        printer.close()
+        force_serial.close()
 
         print(f"Combined synchronized log saved to {combined_csv}")
         print(f"Legacy printer log saved to {legacy_csv}")
