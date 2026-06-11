@@ -1,1 +1,1 @@
-run
+REPEATS_PER_POINT = 10
